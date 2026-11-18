@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import torch
 from jax.sharding import Mesh
 from torchax.interop import jax_view, torch_view
@@ -139,6 +140,13 @@ def vllm_keeps_tokens_sharded(vllm_config: VllmConfig | None,
     """
     if vllm_config is None:
         return False
+    if os.environ.get("DENSE_SP") == "1":
+        # Experimental: token-sharded residual stream for dense TP models
+        # (no MoE, no attention DP). Row-parallel linears reduce-scatter and
+        # column-parallel ones all-gather tokens inside sharded_matmul /
+        # sharded_quantized_matmul (`_sp_layout`) instead of a plain psum, so
+        # XLA can overlap the collectives with the matmuls.
+        return bool(vllm_config.additional_config.get("enable_sp", False))
     if (vllm_config.model_config.quantization
             not in _SP_TOKEN_SHARDING_QUANTIZATIONS):
         return False
