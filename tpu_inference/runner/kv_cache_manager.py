@@ -816,6 +816,39 @@ class KVCacheManager:
                     raise ValueError(
                         f"Unknown attention type: {attn_module.attn_type}")
 
+            # Gemma 4 MTP on the PyTorch path: the JAX draft looks up
+            # `draft_layer.{i}` in layer_name_to_kvcache_index and otherwise
+            # falls back to cache index i, i.e. the wrong layer's KV. The JAX
+            # branch above registers these redirects; do the same here, mapping
+            # the verifier's `layer.{j}` to this path's attention module name.
+            speculative_config = self.runner.speculative_config
+            if speculative_config and speculative_config.use_gemma4_mtp():
+                import re
+
+                from tpu_inference.models.common.kv_share import \
+                    compute_mtp_kv_share_map
+                model_config = self.runner.model_config
+                text_config = getattr(model_config, "hf_text_config",
+                                      model_config.hf_config)
+                redirects = compute_mtp_kv_share_map(
+                    speculative_config.draft_model_config.hf_config,
+                    text_config)
+                index_to_name: dict[int, str] = {}
+                for name in kv_cache_spec:
+                    m = re.search(r"layers\.(\d+)\.", name)
+                    if m:
+                        index_to_name.setdefault(int(m.group(1)), name)
+                for draft_layer, target_layer in redirects.items():
+                    j = int(target_layer.rsplit(".", 1)[-1])
+                    if j not in index_to_name:
+                        raise ValueError(
+                            f"MTP redirect {draft_layer} -> {target_layer}: no "
+                            f"attention layer with index {j} in kv_cache_spec")
+                    self.shared_kv_cache_layers[draft_layer] = (
+                        index_to_name[j])
+                    logger.info("MTP KV redirect (PyTorch path): %s -> %s",
+                                draft_layer, index_to_name[j])
+
         return kv_cache_spec
 
     def get_kv_cache_layout(self):
