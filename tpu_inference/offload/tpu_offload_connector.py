@@ -100,6 +100,7 @@ feedback mechanism mediated by the vLLM engine's `KVConnectorOutput`.
      internal tracking sets (`_reqs_being_saved`).
 """
 import copy
+import os
 import random
 import time
 from collections import defaultdict
@@ -113,7 +114,7 @@ from jax.sharding import Mesh
 from vllm.config import VllmConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+    KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole, SupportsHMA)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import \
     KVConnectorStats
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -157,6 +158,46 @@ BLOCK_SIZE_BUCKETS = envs.TPU_OFFLOAD_BLOCK_SIZE_BUCKETS
 # 3. dynamic: keep the partial block as is.
 PARTIAL_BLOCK_SAVE_BEHAVIOR = Literal["drop"]
 
+# HMA (hybrid KV cache manager) support.
+# With several KV cache groups (e.g. Gemma's full-attention and sliding-window
+# layers), each group has its own block table, and the groups' layers share the
+# physical KV arrays. A CPU chunk holds one block *position* of the sequence for
+# every group: the per-group block ids for a position are gathered from the
+# arrays that hold that group's layers and stored as one flat list.
+# Block ids are therefore carried as one list per group (list[list[int]]).
+# vLLM's null block (id 0) marks positions a group no longer keeps (outside the
+# sliding window); those are never saved, and loads skip them.
+NULL_BLOCK_ID = 0
+# Max group-blocks moved host->device per scatter, bounds the transient HBM a
+# load needs regardless of the prefix length.
+LOAD_PIECE_BLOCKS = 16
+# Sparse sliding-window saves (TPU_OFFLOAD_SW_SAVE_EVERY=k > 1): sliding-window
+# groups make up most of the bytes but a prefix hit ending at block e only
+# needs their last window (blocks just before e). Their blocks are saved only
+# for the TPU_OFFLOAD_SW_SAVE_TAIL positions before every multiple of k, and
+# host prefix hits are cut down to a multiple of k blocks (up to k-1 blocks are
+# recomputed). Full-attention groups are always saved. k=1: save everything.
+SW_SAVE_EVERY = int(os.getenv("TPU_OFFLOAD_SW_SAVE_EVERY", "1"))
+SW_SAVE_TAIL = int(os.getenv("TPU_OFFLOAD_SW_SAVE_TAIL", "3"))
+
+
+def _sw_saved(pos: int) -> bool:
+    """Whether sliding-window groups' data is saved for block position pos."""
+    if SW_SAVE_EVERY <= 1:
+        return True
+    return any((pos + j) % SW_SAVE_EVERY == 0
+               for j in range(1, SW_SAVE_TAIL + 1))
+
+
+def _as_group_lists(block_ids) -> list[list[int]]:
+    """Normalize vLLM block ids (tuple of per-group lists, or a flat list for
+    a single group) to list[list[int]]."""
+    if block_ids is None or len(block_ids) == 0:
+        return []
+    if isinstance(block_ids[0], (list, tuple)):
+        return [list(g) for g in block_ids]
+    return [list(block_ids)]
+
 
 @dataclass
 class SaveSpec:
@@ -164,10 +205,13 @@ class SaveSpec:
     num_skip_leading_tokens: int
     # total processed tokens for matching / saving
     num_total_tokens: int
-    src_blocks: list[int]
+    # per KV cache group: src block id of each position to save
+    src_blocks: list[list[int]]
     dst_chunks: list[int]
     # final save for the (newly) finished request
     is_final_save: bool = False
+    # absolute block position of each saved chunk (sparse sliding-window saves)
+    positions: list[int] = field(default_factory=list)
     # A direct signal to the worker to skip the data transfer but still
     # process the completion signal if is_final_save is True.
     skip_save: bool = False
@@ -178,7 +222,9 @@ class LoadSpec:
     """Internal scheduler state for a potential load operation."""
     num_matched_tokens: int
     src_chunks: list[int]
-    dst_blocks: list[int]
+    # per KV cache group: dst block id of each position to load
+    # (NULL_BLOCK_ID = the group does not keep that position; not loaded)
+    dst_blocks: list[list[int]]
     can_load: bool = False
     num_skip_leading_tokens: int = 0
 
@@ -269,27 +315,26 @@ class RequestTracker:
     save_watermark: int = 0
     # Whether the request is in the decoding phase (generating one token at a time).
     is_decode_phase: bool = False
+    # vLLM's num_computed_tokens before the current step (HMA save liveness)
+    num_computed_before_step: int = 0
 
-    def update(self, new_block_ids: list[int], new_token_ids: list[int]):
-        """Appends new block IDs and token IDs to the tracker."""
-        if new_block_ids is None:
-            new_block_ids = []
-        elif len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            pass
-        else:
+    def update(self, new_block_ids, new_token_ids: list[int]):
+        """Appends new block IDs (per KV cache group) and token IDs."""
+        if new_block_ids is not None and not isinstance(
+                new_block_ids, (list, tuple)):
             raise ValueError(
                 f"Unsupported new_block_ids type {type(new_block_ids)}")
+        new_groups = _as_group_lists(new_block_ids)
         logger.debug(
-            f" update req({self.req_id}): new_blocks: {new_block_ids}, "
+            f" update req({self.req_id}): new_blocks: {new_groups}, "
             f"num_new_tokens: {len(new_token_ids)}; "
             f"existing blocks:{self.block_ids}, "
             f"existing tokens: {len(self.token_ids)}.")
 
-        self.block_ids.extend(new_block_ids)
+        for g, new_g in enumerate(new_groups):
+            while len(self.block_ids) <= g:
+                self.block_ids.append([])
+            self.block_ids[g].extend(new_g)
         self.token_ids.extend(new_token_ids)
 
         # NOTE(jcgu): is it always true? will MTP affect this judgement?
@@ -303,7 +348,7 @@ class RequestTracker:
             1. block_id
             2. execution phase (prefill, decode)
         """
-        self.block_ids = []
+        self.block_ids = [[] for _ in self.block_ids]
         self.token_ids = []
         self.is_decode_phase = False
 
@@ -438,7 +483,7 @@ class TPUOffloadConnectorMetadata(KVConnectorMetadata):
     requests_meta: list[TPUReqMeta] = field(default_factory=list)
 
 
-class TPUOffloadConnector(KVConnectorBase_V1):
+class TPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def __init__(
         self,
@@ -466,7 +511,7 @@ class TPUOffloadConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = \
-                TPUOffloadConnectorScheduler(vllm_config)
+                TPUOffloadConnectorScheduler(vllm_config, kv_cache_config)
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
@@ -532,6 +577,21 @@ class TPUOffloadConnector(KVConnectorBase_V1):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # Saves only read the staging buffer, never the request's blocks, so
+        # blocks can be freed right away for every group.
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, block_ids)
+
+    def reset_cache(self) -> bool | None:
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.reset_cache()
 
     ############################################################
     # Worker Side Methods
@@ -608,10 +668,33 @@ class TPUOffloadConnectorScheduler():
        and transition CPU chunks to 'ready_to_load' status.
     """
 
-    def __init__(self, vllm_config: "VllmConfig"):
+    def __init__(self, vllm_config: "VllmConfig",
+                 kv_cache_config: KVCacheConfig | None = None):
         logger.info("TPUOffloadConnectorScheduler: Entering __init__")
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
+        # HMA: smallest sliding window among the KV cache groups (None: no
+        # sliding-window group). vLLM frees a sliding-window group's blocks
+        # once they fall out of the window, while the tracker keeps the old
+        # ids, so only positions inside the window may be saved.
+        self.min_sliding_window = None
+        groups = (kv_cache_config.kv_cache_groups
+                  if kv_cache_config is not None else [])
+        windows = []
+        for g in groups:
+            spec = g.kv_cache_spec
+            specs = (list(spec.kv_cache_specs.values()) if hasattr(
+                spec, "kv_cache_specs") else [spec])
+            windows += [getattr(x, "sliding_window", None) for x in specs]
+        windows = [w for w in windows if w]
+        if len(groups) > 1 and not windows:
+            logger.warning("TPUOffloadConnector: several KV cache groups but "
+                           "no sliding window found; saves are unguarded.")
+        if windows:
+            self.min_sliding_window = min(windows)
+        logger.info(
+            f"TPUOffloadConnectorScheduler: {len(groups)} KV cache groups, "
+            f"min sliding window {self.min_sliding_window}")
 
         # offloading manager
         self.num_cpu_chunks = envs.TPU_OFFLOAD_NUM_CPU_CHUNKS
@@ -664,8 +747,21 @@ class TPUOffloadConnectorScheduler():
         # NOTE(jcgu): Need to find a way to grab page_size_bytes in scheduler
         # otherwise, we can only use # of blocks as input, instead of buffer size in GB
         self.num_staging_blocks = envs.TPU_OFFLOAD_NUM_STAGING_BLOCKS
+        # TPU_OFFLOAD_SAVE_STAGING_BLOCKS: cap on in-flight saved positions
+        # (default: the HBM staging reservation, NUM_STAGING_BLOCKS). The
+        # reservation counts every layer at the padded page size, so a larger
+        # cap can fit when saved chunks are smaller (sparse saves).
+        self.num_save_staging_blocks = int(
+            os.getenv("TPU_OFFLOAD_SAVE_STAGING_BLOCKS",
+                      str(self.num_staging_blocks)))
         self.staging_buffer_manager = StagingBufferManager(
-            num_blocks=self.num_staging_blocks)
+            num_blocks=self.num_save_staging_blocks)
+        # Loads are scattered piecewise (LOAD_PIECE_BLOCKS group-blocks at a
+        # time), so their HBM footprint is bounded by the worker, not by the
+        # staging budget. Capping loads by staging blocks would truncate long
+        # prefix hits (the remainder is recomputed, never reloaded), so loads
+        # get their own, effectively unlimited, accounting.
+        self.load_staging_manager = StagingBufferManager(num_blocks=1 << 30)
 
         self.metrics_collector = TPUKVCacheMetrics.get_or_create()
 
@@ -831,6 +927,19 @@ class TPUOffloadConnectorScheduler():
         )
         return num_tp_workers
 
+    def reset_cache(self) -> bool:
+        """Forget every CPU chunk (POST /reset_prefix_cache?reset_external=true).
+        Worker-side copies are overwritten as chunk ids get reused."""
+        if (self._reqs_being_saved or self._reqs_being_loaded
+                or self._request_trackers):
+            logger.warning("TPUOffloadConnector: reset_cache refused, "
+                           "transfers or requests in flight.")
+            return False
+        self.offload_manager = LRUCacheManager(
+            num_cpu_chunks=self.num_cpu_chunks)
+        logger.info("TPUOffloadConnector: CPU cache reset.")
+        return True
+
     def _get_request_block_hashes(self, req: "Request") -> list[BlockHash]:
         # request's original block_hashes do not include the last partial block
         # TODO(jcgu): add an option to use local token_processor
@@ -858,6 +967,9 @@ class TPUOffloadConnectorScheduler():
 
         # look for blocks in the cache
         num_hits = self.offload_manager.lookup(block_hashes)
+        if SW_SAVE_EVERY > 1 and self.min_sliding_window is not None:
+            # a hit must end where the sliding-window groups' tail was saved
+            num_hits = num_hits // SW_SAVE_EVERY * SW_SAVE_EVERY
         matched_block_hashes = block_hashes[:num_hits]
 
         self.offload_manager.touch(block_hashes)
@@ -873,7 +985,7 @@ class TPUOffloadConnectorScheduler():
         if num_blocks_to_load > 0:
             # TODO: add metrics here to verify there is blocks to load ever
             # planning staging blocks for load
-            num_avail_staging_blocks = self.staging_buffer_manager.get_num_free_staging_blocks(
+            num_avail_staging_blocks = self.load_staging_manager.get_num_free_staging_blocks(
             )
             if num_blocks_to_load > num_avail_staging_blocks:
                 # reduce blocks_to_load (and matched tokens) when there are insufficient staging blocks.
@@ -896,7 +1008,7 @@ class TPUOffloadConnectorScheduler():
                     dst_blocks=dummy_dst_blocks,
                     num_skip_leading_tokens=num_computed_tokens,
                 )
-                num_allocated_staging_blocks = self.staging_buffer_manager.allocate(
+                num_allocated_staging_blocks = self.load_staging_manager.allocate(
                     request.request_id,
                     num_blocks=num_blocks_to_load,
                     usage="load")
@@ -964,9 +1076,9 @@ class TPUOffloadConnectorScheduler():
             assert num_matched_blocks == load_spec.num_matched_tokens // self.block_size, f"{num_matched_blocks} != {load_spec.num_matched_tokens} // {self.block_size}"
 
             block_hashes = self._get_request_block_hashes(request)
-            all_blocks = blocks.get_block_ids()[0]
+            all_blocks = _as_group_lists(blocks.get_block_ids())
             logger.debug(
-                f"  Request: {request.request_id} has {len(all_blocks)} blocks / {len(block_hashes)} block hashes."
+                f"  Request: {request.request_id} has {[len(g) for g in all_blocks]} blocks / {len(block_hashes)} block hashes."
             )
 
             # get the src chunk ids to load
@@ -977,7 +1089,16 @@ class TPUOffloadConnectorScheduler():
             src_chunk_ids = [chunk.chunk_id for chunk in chunks_to_load]
 
             # get dst block ids
-            dst_blocks = all_blocks[skip_leading_blocks:num_matched_blocks]
+            # get dst block ids, per KV cache group
+            dst_blocks = [
+                g[skip_leading_blocks:num_matched_blocks] for g in all_blocks
+            ]
+            for g in dst_blocks:
+                assert len(g) == len(src_chunk_ids), f"{len(g)} != {len(src_chunk_ids)}"
+            # every position needs the block of at least one group
+            assert all(
+                any(g[i] != NULL_BLOCK_ID for g in dst_blocks)
+                for i in range(len(src_chunk_ids)))
 
             # update load spec
             load_spec.src_chunks = src_chunk_ids
@@ -1008,9 +1129,9 @@ class TPUOffloadConnectorScheduler():
         num_full_blocks = num_tracked_tokens // self.block_size
         adjusted_num_total_blocks = num_full_blocks
         adjusted_num_total_tokens = num_full_blocks * self.block_size
-        assert adjusted_num_total_blocks <= len(
-            tracker.block_ids
-        ), f"Req({req_id}, len_tokens:{len(tracker.token_ids)}, num_tokens:{_request.num_tokens}, {adjusted_num_total_blocks} > {len(tracker.block_ids)}"
+        assert all(
+            adjusted_num_total_blocks <= len(g) for g in tracker.block_ids
+        ), f"Req({req_id}, len_tokens:{len(tracker.token_ids)}, num_tokens:{_request.num_tokens}, {adjusted_num_total_blocks} > {[len(g) for g in tracker.block_ids]}"
 
         # not all block_hashes (for resumed requests) are touched
         block_hashes = self._get_request_block_hashes(_request)
@@ -1088,6 +1209,33 @@ class TPUOffloadConnectorScheduler():
             num_skip_leading_tokens = num_skip_leading_blocks * self.block_size
             num_blocks_to_save = adjusted_num_total_blocks - num_skip_leading_blocks
 
+            # HMA: a position can only be saved while every group still holds
+            # its block. Sliding-window groups replace blocks that fell out of
+            # the window with the null block; stop before the first one (that
+            # prefix then simply ends there in the CPU cache).
+            # The tracker never sees vLLM null out freed blocks, so decide by
+            # token counts: a position is alive if it starts no earlier than
+            # one window before the tokens computed before this step.
+            for i in range(num_blocks_to_save):
+                pos = num_skip_leading_blocks + i
+                # Only sliding-window blocks get freed early; positions whose
+                # sliding-window data isn't saved (sparse saves) stay valid.
+                stale = (self.min_sliding_window is not None
+                         and _sw_saved(pos)
+                         and pos * self.block_size <
+                         tracker.num_computed_before_step -
+                         self.min_sliding_window)
+                if stale:
+                    logger.warning(
+                        f"Req({req_id}): block position {pos} may already be "
+                        f"freed by a sliding-window group (computed before "
+                        f"step {tracker.num_computed_before_step}); saving "
+                        f"only {i} of {num_blocks_to_save} blocks.")
+                    num_blocks_to_save = i
+                    adjusted_num_total_blocks = pos
+                    adjusted_num_total_tokens = pos * self.block_size
+                    break
+
             # planning staging blocks for save
             num_avail_staging_blocks = self.staging_buffer_manager.get_num_free_staging_blocks(
             )
@@ -1110,11 +1258,14 @@ class TPUOffloadConnectorScheduler():
                     chunks_for_save, chunk_idxs = allocate_output
                     adjusted_num_blocks_to_save = len(chunks_for_save)
                     assert num_blocks_to_save >= adjusted_num_blocks_to_save, f"{num_blocks_to_save} < {adjusted_num_blocks_to_save}"
-                    src_block_ids = tracker.block_ids[
-                        num_skip_leading_blocks:adjusted_num_total_blocks]
+                    src_block_ids = [
+                        g[num_skip_leading_blocks:adjusted_num_total_blocks]
+                        for g in tracker.block_ids
+                    ]
 
                     dst_chunks = [chunk.chunk_id for chunk in chunks_for_save]
-                    src_blocks = [src_block_ids[idx] for idx in chunk_idxs]
+                    src_blocks = [[g[idx] for idx in chunk_idxs]
+                                  for g in src_block_ids]
 
                     # This is a real save operation.
                     save_spec = SaveSpec(
@@ -1123,6 +1274,10 @@ class TPUOffloadConnectorScheduler():
                         is_final_save=is_finished,
                         skip_save=False,
                         src_blocks=src_blocks,
+                        positions=[
+                            num_skip_leading_blocks + idx
+                            for idx in chunk_idxs
+                        ],
                         dst_chunks=dst_chunks,
                     )
                     self._reqs_being_saved[req_id] |= set(dst_chunks)
@@ -1263,10 +1418,11 @@ class TPUOffloadConnectorScheduler():
             tracker = RequestTracker(
                 req_id=req_id,
                 prompt_len=len(request.prompt_token_ids),
-                block_ids=copy.deepcopy(request.block_ids[0]),
+                block_ids=_as_group_lists(request.block_ids),
                 token_ids=tokens_for_tracker,
                 # The high-water mark for saved tokens starts after the cached prefix.
                 save_watermark=initial_save_watermark,
+                num_computed_before_step=request.num_computed_tokens,
             )
             self._request_trackers[req_id] = tracker
             logger.debug(
@@ -1328,6 +1484,7 @@ class TPUOffloadConnectorScheduler():
 
             # 2. update
             tracker.update(new_blocks, new_token_ids)
+            tracker.num_computed_before_step = _request.num_computed_tokens
 
             # for cached requests, whose kv pages get evicted, there will be
             # load operations.
@@ -1349,7 +1506,7 @@ class TPUOffloadConnectorScheduler():
         # clean up the temporary states of requests that are not scheduled
         for req_id, _load_spec in self._pre_load_specs.items():
             logger.debug(f"non-scheduled-reuqest:{req_id}")
-            _freed_num_staging_blocks = self.staging_buffer_manager.free(
+            _freed_num_staging_blocks = self.load_staging_manager.free(
                 req_id, "load")
             assert _freed_num_staging_blocks == len(
                 _load_spec.src_chunks
@@ -1471,7 +1628,7 @@ class TPUOffloadConnectorScheduler():
                     logger.debug(
                         f"  fully_completed_load_chunks for {req_id}: {fully_completed_load_chunks}"
                     )
-                    self.staging_buffer_manager.free(
+                    self.load_staging_manager.free(
                         req_id,
                         usage="load",
                         num_finished_blocks=num_loaded_chunks)
@@ -1602,6 +1759,45 @@ class TPUOffloadConnectorWorker:
             self.grouped_layer_indices = self._group_layers_by_shape(kv_caches)
             self.grouped_layer_indices_tuple = tuple(
                 tuple(group) for group in self.grouped_layer_indices)
+
+            # HMA: per KV cache group, the KV arrays that hold its layers and
+            # their shape groups (indices relative to that subset).
+            self.kvg_arrays: list[tuple[int, ...]] = []
+            self.kvg_shape_groups: list[tuple[tuple[int, ...], ...]] = []
+            kv_cache_config = getattr(runner, "kv_cache_config", None)
+            groups = (kv_cache_config.kv_cache_groups
+                      if kv_cache_config is not None else [])
+            for group in groups:
+                idx = sorted({
+                    runner.layer_name_to_kvcache_index[name]
+                    for name in group.layer_names
+                    if name in runner.layer_name_to_kvcache_index
+                })
+                self.kvg_arrays.append(tuple(idx))
+            if not self.kvg_arrays:
+                self.kvg_arrays = [tuple(range(len(kv_caches)))]
+            for idx in self.kvg_arrays:
+                self.kvg_shape_groups.append(
+                    tuple(
+                        tuple(g) for g in self._group_layers_by_shape(
+                            [kv_caches[i] for i in idx])))
+            self.num_kv_cache_groups = len(self.kvg_arrays)
+            self.kvg_is_sw = []
+            for group in groups:
+                spec = group.kv_cache_spec
+                specs = (list(spec.kv_cache_specs.values()) if hasattr(
+                    spec, "kv_cache_specs") else [spec])
+                self.kvg_is_sw.append(
+                    any(getattr(x, "sliding_window", None) for x in specs))
+            if len(self.kvg_is_sw) != self.num_kv_cache_groups:
+                self.kvg_is_sw = [False] * self.num_kv_cache_groups
+            logger.info(f"  - sliding-window groups: {self.kvg_is_sw}, "
+                        f"SW_SAVE_EVERY={SW_SAVE_EVERY}, "
+                        f"SW_SAVE_TAIL={SW_SAVE_TAIL}")
+            logger.info(
+                f"  - KV cache groups: {self.num_kv_cache_groups}, "
+                f"arrays per group: {self.kvg_arrays}, "
+                f"shape groups: {self.kvg_shape_groups}")
 
             # Cache the kv sharding spec at initialization
             # to prevent recompilation. This avoids deriving
@@ -1747,67 +1943,151 @@ class TPUOffloadConnectorWorker:
         """
         Pre-compiles the functions used for KV cache swapping
         with a variety of common block sizes to avoid runtime recompilation.
+        One set per distinct (KV array subset, shape groups) of the KV cache
+        groups (HMA); a single set when all groups share the same arrays.
         """
         logger.debug("Starting pre-compilation of KV cache swap operations")
         start_time = time.time()
-        paged_kv_for_compilation = self.runner.kv_caches
         num_warmup = 2
-        all_block_ids = list(range(self.num_kv_blocks))
+        all_block_ids = list(range(1, self.num_kv_blocks))
+        combos = {}
+        for g in range(self.num_kv_cache_groups):
+            combos.setdefault(
+                (self.kvg_arrays[g], self.kvg_shape_groups[g]), g)
 
         with jax.set_mesh(self.mesh):
-            for num_blocks in BLOCK_SIZE_BUCKETS:
-                try:
-                    logger.debug(f"  - Compiling for {num_blocks} blocks...")
+            for g in combos.values():
+                sg = self.kvg_shape_groups[g]
+                for num_blocks in BLOCK_SIZE_BUCKETS:
+                    try:
+                        logger.debug(
+                            f"  - Compiling group {g} for {num_blocks} blocks...")
+                        for _ in range(num_warmup):
+                            dummy_block_ids = random.sample(
+                                all_block_ids, num_blocks)
+                            dummy_block_ids_arr = jnp.array(dummy_block_ids)
+                            sub = self._kvg_subset(g)
+                            # 1. gather / stack (for save)
+                            sub, stacked = self._do_stack(
+                                sub, dummy_block_ids_arr, num_blocks, sg)
+                            if isinstance(stacked[0], list):
+                                stacked = [[
+                                    jax.device_put(
+                                        x, self.expanded_device_sharding)
+                                    for x in group_chunks
+                                ] for group_chunks in stacked]
+                            else:
+                                stacked = [
+                                    jax.device_put(
+                                        chunk, self.expanded_device_sharding)
+                                    for chunk in stacked
+                                ]
+                            jax.block_until_ready(stacked)
+                            # 2. update / insert kv (for load)
+                            sub = self._do_update(sub, stacked,
+                                                  dummy_block_ids, self.mesh,
+                                                  self.cached_kv_sharding_spec,
+                                                  self.indices_sharding, sg)
+                            jax.block_until_ready(sub)
+                            self._kvg_writeback(g, sub)
+                    except Exception as e:
+                        logger.warning(
+                            f"    - Failed to pre-compile group {g} for "
+                            f"{num_blocks} blocks: {e}",
+                            exc_info=True)
 
-                    # Warm up
-                    for _ in range(num_warmup):
-                        dummy_block_ids = random.sample(
-                            all_block_ids, num_blocks)
-                        dummy_block_ids_arr = jnp.array(dummy_block_ids)
-
-                        # 1. gather / stack (for save)
-                        paged_kv_for_compilation, stacked_dummy_kv_caches_tpu = self._do_stack(
-                            paged_kv_for_compilation, dummy_block_ids_arr,
-                            num_blocks, self.grouped_layer_indices_tuple)
-                        if isinstance(stacked_dummy_kv_caches_tpu[0], list):
-                            stacked_dummy_kv_caches_tpu = [[
-                                jax.device_put(x,
-                                               self.expanded_device_sharding)
-                                for x in group_chunks
-                            ] for group_chunks in stacked_dummy_kv_caches_tpu]
-                        else:
-                            stacked_dummy_kv_caches_tpu = [
-                                jax.device_put(chunk,
-                                               self.expanded_device_sharding)
-                                for chunk in stacked_dummy_kv_caches_tpu
-                            ]
-                        jax.block_until_ready(stacked_dummy_kv_caches_tpu)
-
-                        # 2. update / insert  kv (for load)
-                        updated_kv_caches = self._do_update(
-                            paged_kv_for_compilation,
-                            stacked_dummy_kv_caches_tpu, dummy_block_ids,
-                            self.mesh, self.cached_kv_sharding_spec,
-                            self.indices_sharding,
-                            self.grouped_layer_indices_tuple)
-
-                        jax.block_until_ready(updated_kv_caches)
-                        paged_kv_for_compilation = updated_kv_caches
-
-                except Exception as e:
-                    logger.warning(
-                        f"    - Failed to pre-compile for {num_blocks} blocks: {e}",
-                        exc_info=True)
-
-        self.runner.kv_caches = paged_kv_for_compilation
         duration = time.time() - start_time
-        logger.debug("KV cache swap pre-compilation finished in %.2f [secs].",
-                     duration)
+        logger.info("KV cache swap pre-compilation finished in %.2f [secs].",
+                    duration)
+
+    def _kvg_subset(self, g: int) -> list[jax.Array]:
+        """The KV arrays holding KV cache group g's layers."""
+        return [self.runner.kv_caches[i] for i in self.kvg_arrays[g]]
+
+    def _kvg_writeback(self, g: int, new_subset: list[jax.Array]) -> None:
+        """Put group g's (donated and returned) arrays back into the runner."""
+        kv_caches = list(self.runner.kv_caches)
+        for j, i in enumerate(self.kvg_arrays[g]):
+            kv_caches[i] = new_subset[j]
+        self.runner.kv_caches = kv_caches
+
+    def _kvg_saved(self, g: int, pos: int | None) -> bool:
+        """Whether group g's data is in the chunk of block position pos."""
+        return pos is None or not self.kvg_is_sw[g] or _sw_saved(pos)
+
+    def _kvg_payload_slice(self, g: int,
+                           pos: int | None = None) -> tuple[int, int]:
+        """Where group g's arrays sit in the flat payload of position pos."""
+        off = sum(
+            len(self.kvg_shape_groups[h]) for h in range(g)
+            if self._kvg_saved(h, pos))
+        return off, off + len(self.kvg_shape_groups[g])
+
+    def _gather_positions(self,
+                          src_blocks: list[list[int]],
+                          positions: list[int] | None = None) -> list[list]:
+        """Gather block positions from HBM into the staging buffer.
+        src_blocks[g][i] is group g's block of position i. Returns one flat
+        payload (list of [1, num_layers, ...] arrays) per position: for each
+        saved group in order, one array per shape group of its KV arrays."""
+        n = len(src_blocks[0])
+        if positions is None or len(positions) != n:
+            positions = [None] * n
+        out: list[list] = [[] for _ in range(n)]
+        for g, blocks in enumerate(src_blocks):
+            assert len(blocks) == n
+            idx = [i for i in range(n) if self._kvg_saved(g, positions[i])]
+            if not idx:
+                continue
+            blocks = [blocks[i] for i in idx]
+            assert NULL_BLOCK_ID not in blocks, f"group {g}: null block in save {blocks}"
+            sg = self.kvg_shape_groups[g]
+            sub = self._kvg_subset(g)
+            if self.use_bucketed_swap_ops:
+                sub, gathered = self._bucketed_stack_kv_caches(sub, blocks, sg)
+            else:
+                sub, gathered = self._do_stack(sub, jnp.array(blocks),
+                                               len(blocks), sg)
+            self._kvg_writeback(g, sub)
+            for j, i in enumerate(idx):
+                x = gathered[j]
+                out[i].extend(x if isinstance(x, list) else [x])
+        return out
+
+    def _load_group(self, g: int, payloads: list[list],
+                    dst_blocks: list[int], positions: list[int]) -> None:
+        """H2D + scatter of group g's part of `payloads` into `dst_blocks`,
+        LOAD_PIECE_BLOCKS at a time to bound the transient HBM."""
+        sg = self.kvg_shape_groups[g]
+        sl = []
+        for pos in positions:
+            assert self._kvg_saved(g, pos), (
+                f"group {g} needs block position {pos}, which is not saved")
+            sl.append(self._kvg_payload_slice(g, pos))
+        for start in range(0, len(dst_blocks), LOAD_PIECE_BLOCKS):
+            dst_piece = dst_blocks[start:start + LOAD_PIECE_BLOCKS]
+            host_parts = [
+                p[lo:hi] for p, (lo, hi) in zip(
+                    payloads[start:start + len(dst_piece)],
+                    sl[start:start + len(dst_piece)])
+            ]
+            dev_parts = jax.device_put(host_parts,
+                                       self.expanded_device_sharding)
+            piece = [x if len(sg) > 1 else x[0] for x in dev_parts]
+            sub = self._kvg_subset(g)
+            if self.use_bucketed_swap_ops:
+                sub = self._bucketed_update_kv_caches(sub, piece, dst_piece, sg)
+            else:
+                sub = self._do_update(sub, piece, dst_piece, self.mesh,
+                                      self.cached_kv_sharding_spec,
+                                      self.indices_sharding, sg)
+            self._kvg_writeback(g, sub)
 
     def _bucketed_stack_kv_caches(
         self,
         kv_caches: list[jax.Array],
         block_ids: list[int],
+        grouped_indices=None,
     ) -> tuple[list[jax.Array], list[Any]]:
         """
         Gathers KV cache data for the given block_ids by breaking the operation
@@ -1818,7 +2098,8 @@ class TPUOffloadConnectorWorker:
             return kv_caches, []
         if num_blocks in BLOCK_SIZE_BUCKETS:
             block_ids_arr = jnp.array(block_ids)
-            return self._do_stack(kv_caches, block_ids_arr, num_blocks)
+            return self._do_stack(kv_caches, block_ids_arr, num_blocks,
+                                  grouped_indices)
 
         # 2. Report the latency of decomposed_block_sizes
         decomposed_block_buckets = self._decompose_into_buckets(block_ids)
@@ -1838,7 +2119,8 @@ class TPUOffloadConnectorWorker:
             block_slice = decomposed_block_slice_arr[i]
             # Update current_kv_caches with the latest valid handle
             current_kv_caches, gathered_chunk = self._do_stack(
-                current_kv_caches, block_slice, len(decomposed_block_bucket))
+                current_kv_caches, block_slice, len(decomposed_block_bucket),
+                grouped_indices)
             gathered_chunks.extend(gathered_chunk)
 
         return current_kv_caches, gathered_chunks
@@ -1848,17 +2130,20 @@ class TPUOffloadConnectorWorker:
         kv_caches: list[jax.Array],
         kv_cache_slices: list[Any],
         dst_blocks: list[int],
+        grouped_indices=None,
     ) -> list[jax.Array]:
         """
         Inserts KV cache slices into the main cache in bucket-aligned chunks.
         """
+        if grouped_indices is None:
+            grouped_indices = self.grouped_layer_indices_tuple
         num_blocks = len(dst_blocks)
         if num_blocks == 0:
             return kv_caches
         if num_blocks in BLOCK_SIZE_BUCKETS:
             return self._do_update(kv_caches, kv_cache_slices, dst_blocks,
                                    self.mesh, self.cached_kv_sharding_spec,
-                                   self.indices_sharding)
+                                   self.indices_sharding, grouped_indices)
 
         decomposed_block_buckets = self._decompose_into_buckets(dst_blocks)
         logger.debug(
@@ -1874,7 +2159,7 @@ class TPUOffloadConnectorWorker:
             updated_kv_caches = self._do_update(
                 updated_kv_caches, slices_for_bucket, decomposed_block_bucket,
                 self.mesh, self.cached_kv_sharding_spec, self.indices_sharding,
-                self.grouped_layer_indices_tuple)
+                grouped_indices)
             block_offset = next_offset
 
         return updated_kv_caches
@@ -1919,7 +2204,7 @@ class TPUOffloadConnectorWorker:
             f"blocks_to_save({len(blocks_to_save)}: {blocks_to_save}), "
             f"dst_chunks({len(dst_chunks)}: {dst_chunks}) ")
 
-        if not blocks_to_save and tokens_to_save:
+        if not dst_chunks and tokens_to_save:
             logger.warning(
                 f"Request {req_id}: Tokens to save but no corresponding blocks found."
             )
@@ -1931,21 +2216,21 @@ class TPUOffloadConnectorWorker:
             )
             return None
 
-        # Verify if blocks_to_save is a contiguous subarray of full_block_ids
-        first_src_block = blocks_to_save[0]
-        last_src_block = blocks_to_save[-1]
-        try:
-            first_block_idx_in_full = full_block_ids.index(first_src_block)
-            last_block_idx_in_full = full_block_ids.index(last_src_block)
-            if not (last_block_idx_in_full - first_block_idx_in_full + 1
-                    == len(blocks_to_save)):
-                raise ValueError(
-                    f"Request({req_id}): blocks_to_save {blocks_to_save} does not exist in full_block_ids {full_block_ids}"
-                )
-        except Exception:
-            raise ValueError(
-                f"Request({req_id}): blocks_to_save {blocks_to_save} contains blocks not present in local_block_ids {full_block_ids}"
-            )
+        # Verify, per KV cache group, that blocks_to_save is a contiguous
+        # run of the request's blocks.
+        for g, (blocks_g, full_g) in enumerate(zip(blocks_to_save,
+                                                   full_block_ids)):
+            assert len(blocks_g) == len(dst_chunks), (
+                f"Request({req_id}) group {g}: {len(blocks_g)} blocks for "
+                f"{len(dst_chunks)} chunks")
+            start = num_skip_leading_tokens // self.block_size
+            run = full_g[start:start + len(blocks_g)]
+            if run != blocks_g:
+                # chunk_idxs may skip positions already in the CPU cache
+                if not set(blocks_g) <= set(full_g):
+                    raise ValueError(
+                        f"Request({req_id}) group {g}: blocks_to_save "
+                        f"{blocks_g} not in local_block_ids {full_g}")
 
         return blocks_to_save, dst_chunks
 
@@ -1974,16 +2259,10 @@ class TPUOffloadConnectorWorker:
             return None
 
         blocks_to_save, dst_chunks = plan
-        num_blocks_to_save = len(blocks_to_save)
+        num_blocks_to_save = len(dst_chunks)
 
-        if self.use_bucketed_swap_ops:
-            kv_caches, gathered_kv_caches_tpu = self._bucketed_stack_kv_caches(
-                self.runner.kv_caches, blocks_to_save)
-        else:
-            blocks_to_save_arr = jnp.array(blocks_to_save)
-            kv_caches, gathered_kv_caches_tpu = self._do_stack(
-                self.runner.kv_caches, blocks_to_save_arr, num_blocks_to_save)
-        self.runner.kv_caches = kv_caches
+        gathered_kv_caches_tpu = self._gather_positions(
+            blocks_to_save, save_spec.positions)
 
         if gathered_kv_caches_tpu is not None:
             if isinstance(gathered_kv_caches_tpu[0], list):
@@ -2023,6 +2302,7 @@ class TPUOffloadConnectorWorker:
             return None
 
         all_src_blocks = []
+        all_positions: list[int] = []
         manifest = []
         for meta in metadata.requests_meta:
             if meta.save_spec is None:
@@ -2043,9 +2323,13 @@ class TPUOffloadConnectorWorker:
                 continue
 
             blocks_to_save, dst_chunks = plan
-            num_blocks_to_save = len(blocks_to_save)
+            num_blocks_to_save = len(dst_chunks)
 
-            all_src_blocks.extend(blocks_to_save)
+            if not all_src_blocks:
+                all_src_blocks = [[] for _ in blocks_to_save]
+            all_positions.extend(meta.save_spec.positions)
+            for g, blocks_g in enumerate(blocks_to_save):
+                all_src_blocks[g].extend(blocks_g)
             manifest.append(
                 SaveReqInfo(req_id=meta.req_id,
                             num_blocks=num_blocks_to_save,
@@ -2063,16 +2347,9 @@ class TPUOffloadConnectorWorker:
             return None
 
         # 2. SYNC BLOCKING: Unified Batch Gather
-        total_num_blocks_to_save = len(all_src_blocks)
-        if self.use_bucketed_swap_ops:
-            kv_caches, gathered_kv_caches_tpu = self._bucketed_stack_kv_caches(
-                self.runner.kv_caches, all_src_blocks)
-        else:
-            all_src_blocks_arr = jnp.array(all_src_blocks)
-            kv_caches, gathered_kv_caches_tpu = self._do_stack(
-                self.runner.kv_caches, all_src_blocks_arr,
-                total_num_blocks_to_save, self.grouped_layer_indices_tuple)
-        self.runner.kv_caches = kv_caches
+        total_num_blocks_to_save = len(all_src_blocks[0])
+        gathered_kv_caches_tpu = self._gather_positions(
+            all_src_blocks, all_positions)
 
         if gathered_kv_caches_tpu is not None:
             if isinstance(gathered_kv_caches_tpu[0], list):
@@ -2148,6 +2425,10 @@ class TPUOffloadConnectorWorker:
         if duration > 0:
             bw_gbps = (total_size_bytes / (1024**3)) / duration
             self.metrics_collector.record_d2h_transfer_bw(bw_gbps)
+        logger.info(
+            f"D2H: {total_num_blocks_to_save} chunks, "
+            f"{total_size_bytes / 1024**3:.2f} GiB waited {duration:.3f} s "
+            f"after submit")
 
         # 2. Unstitch and Register
         post_transfer_start_time = time.time()
@@ -2463,24 +2744,12 @@ class TPUOffloadConnectorWorker:
                     f"Request {meta.req_id}: No new tokens to load. Skipping.")
                 continue
 
-            # Verify if dst_blocks is a contiguous subarray of meta.local_block_ids
+            for g, dst_g in enumerate(dst_blocks):
+                assert len(dst_g) == len(src_chunks), (
+                    f"Request({meta.req_id}) group {g}: {len(dst_g)} dst "
+                    f"blocks for {len(src_chunks)} chunks")
+            num_blocks_to_load = len(src_chunks)
             assert num_blocks_to_load > 0, f"Request({meta.req_id}) has no dst blocks to load."
-            first_dst_block = dst_blocks[0]
-            last_dst_block = dst_blocks[-1]
-            try:
-                first_block_idx_in_local = meta.local_block_ids.index(
-                    first_dst_block)
-                last_block_idx_in_local = meta.local_block_ids.index(
-                    last_dst_block)
-                if not (last_block_idx_in_local - first_block_idx_in_local + 1
-                        == len(dst_blocks)):
-                    raise ValueError(
-                        f"Request({meta.req_id}): dst_blocks {dst_blocks} does not exist in local_block_ids {meta.local_block_ids}"
-                    )
-            except ValueError:
-                raise ValueError(
-                    f"Request({meta.req_id}): dst_blocks {dst_blocks} contains blocks not present in local_block_ids {meta.local_block_ids}"
-                )
 
             logger.debug(
                 f"Processing KV load for request {meta.req_id}: "
@@ -2489,7 +2758,7 @@ class TPUOffloadConnectorWorker:
                 f"Fetching delta of {num_tokens_to_load_delta} tokens from cache for "
                 f"{num_blocks_to_load} blocks.")
 
-            # Fetch and chunks from the backend.
+            # Fetch chunks from the backend.
             assembled_kv_on_cpu = []
             for i in range(num_blocks_to_load):
                 src_chunk_id = src_chunks[i]
@@ -2502,46 +2771,35 @@ class TPUOffloadConnectorWorker:
                     )
                     return
 
-            # swap-in
-            # [stacked_kv(1, num_layers, block_size, num_head, 2, head_dim)] * num_blocks_to_load
-            raw_chunked_kv_on_tpu = []
-            for i in range(num_blocks_to_load):
-                raw_chunked_kv_on_tpu.append(
-                    jax.device_put(assembled_kv_on_cpu[i],
-                                   self.expanded_device_sharding))
-            jax.block_until_ready(raw_chunked_kv_on_tpu)
-
+            # swap-in + scatter, per KV cache group, only the positions the
+            # group keeps (sliding-window groups: the last window).
             update_kv_start = time.time()
-            if self.use_bucketed_swap_ops:
-                self.runner.kv_caches = self._bucketed_update_kv_caches(
-                    self.runner.kv_caches,
-                    raw_chunked_kv_on_tpu,
-                    dst_blocks,
-                )
-            else:
-                self.runner.kv_caches = self._do_update(
-                    self.runner.kv_caches,
-                    raw_chunked_kv_on_tpu,
-                    dst_blocks,
-                    self.mesh,
-                    self.cached_kv_sharding_spec,
-                    self.indices_sharding,
-                    self.grouped_layer_indices_tuple,
-                )
+            total_size_bytes = 0
+            num_group_blocks = []
+            for g, dst_g in enumerate(dst_blocks):
+                keep = [i for i, b in enumerate(dst_g) if b != NULL_BLOCK_ID]
+                num_group_blocks.append(len(keep))
+                if not keep:
+                    continue
+                skip_blocks = num_skip_leading_tokens // self.block_size
+                positions = [skip_blocks + i for i in keep]
+                payloads = [assembled_kv_on_cpu[i] for i in keep]
+                for p, pos in zip(payloads, positions):
+                    lo, hi = self._kvg_payload_slice(g, pos)
+                    total_size_bytes += sum(x.nbytes for x in p[lo:hi])
+                self._load_group(g, payloads, [dst_g[i] for i in keep],
+                                 positions)
             jax.block_until_ready(self.runner.kv_caches)
             update_duration = time.time() - update_kv_start
-            logger.debug(
-                f"Request {meta.req_id}: Loaded {num_tokens_to_load_delta} tokens into "
-                f"{num_blocks_to_load} new blocks; "
-                f" src_chunks: {src_chunks}, "
-                f" dst blocks: {dst_blocks}, "
-                f" insert duration {update_duration} s.")
+            logger.info(
+                f"Request {meta.req_id}: loaded {num_tokens_to_load_delta} "
+                f"tokens ({num_blocks_to_load} positions; group blocks "
+                f"{num_group_blocks}; {total_size_bytes / 1024**3:.2f} GiB) "
+                f"in {update_duration:.3f} s.")
 
             load_duration = time.time() - request_load_start_time
             load_times.append(load_duration)
             self.metrics_collector.record_h2d_transfer_latency(load_duration)
-            total_size_bytes = sum(
-                self._chunk_nbytes(chunk) for chunk in assembled_kv_on_cpu)
             self.metrics_collector.record_h2d_bytes(total_size_bytes)
             if load_duration > 0:
                 bw_gbps = (total_size_bytes / (1024**3)) / load_duration
