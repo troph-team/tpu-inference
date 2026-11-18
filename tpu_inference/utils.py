@@ -340,6 +340,67 @@ def get_padded_num_heads(num_heads: int, sharding_size: int) -> int:
     return num_heads
 
 
+# UNIFORM_KV_PAGE=1: give every attention layer the same KV cache shape so
+# that layers with different (num_kv_heads, head_dim), e.g. Gemma 4's 16x256
+# sliding-window and 4x512 full-attention layers, alias one KV cache array per
+# vLLM tensor instead of one array per shape. Maps a layer's (padded num KV
+# heads, padded head dim) to the (num KV heads, head dim) of its KV cache.
+# Set by `plan_uniform_kv_shapes` (kv_cache_manager) before the model is
+# traced; read by the vLLM attention backend.
+_UNIFORM_KV_SHAPES: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+
+def uniform_kv_page_enabled() -> bool:
+    import os
+    return os.environ.get("UNIFORM_KV_PAGE", "0").lower() in ("1", "true")
+
+
+def plan_uniform_kv_shapes(shapes: Sequence[Tuple[int, int]],
+                           sharding_size: int) -> bool:
+    """Plan one KV cache shape for all (num_kv_heads, head_dim) shapes.
+
+    The target is (max_elems // max_dim, max_dim), where max_elems is the
+    largest num_kv_heads * head_dim. A shape with the target head dim gets its
+    KV heads replicated (jnp.repeat, which keeps the GQA query grouping). A
+    shape with a smaller head dim d packs p = max_dim // d adjacent KV heads
+    into one head of max_dim; its queries are zero-padded to max_dim so each
+    query head only sees the slice of its own KV head. Returns False, and
+    plans nothing, if some shape cannot be mapped exactly.
+    """
+    shapes = sorted(set(shapes))
+    if len(shapes) < 2:
+        return False
+    max_dim = max(d for _, d in shapes)
+    max_elems = max(h * d for h, d in shapes)
+    if max_elems % max_dim:
+        return False
+    target_h = max_elems // max_dim
+    if target_h % sharding_size:
+        return False
+    plan = {}
+    for h, d in shapes:
+        if d == max_dim:
+            if target_h % h:
+                return False
+        else:
+            if max_dim % d:
+                return False
+            p = max_dim // d
+            if h != target_h * p or (h // sharding_size) % p:
+                return False
+        plan[(h, d)] = (target_h, max_dim)
+    _UNIFORM_KV_SHAPES.clear()
+    _UNIFORM_KV_SHAPES.update(plan)
+    return True
+
+
+def get_uniform_kv_shape(num_kv_heads: int,
+                         head_dim: int) -> Tuple[int, int]:
+    """The planned KV cache shape of a layer, or its own shape if none."""
+    return _UNIFORM_KV_SHAPES.get((num_kv_heads, head_dim),
+                                  (num_kv_heads, head_dim))
+
+
 def get_layer_kv_params(
         text_config: Any,
         layer_type: str) -> Tuple[Optional[int], Optional[int]]:

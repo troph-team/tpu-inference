@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
 from jax.sharding import Mesh
 from torchax.interop import jax_view, torch_view
@@ -274,6 +275,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 # write would overwrite the target's entries with this
                 # layer's discarded K/V and corrupt every subsequent step.
                 update_kv_cache = self.kv_sharing_target_layer_name is None
+                kv_repeat, kv_pack = _uniform_kv_transform(
+                    mesh, self.num_kv_heads, self.head_size)
 
                 new_kv_cache, outputs = _jax_attn_func(
                     kv_cache,
@@ -294,6 +297,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     self.sliding_window,
                     update_kv_cache=update_kv_cache,
                     attention_backend=self.attention_backend,
+                    kv_repeat=kv_repeat,
+                    kv_pack=kv_pack,
                 )
                 # With update_kv_cache=False the kernel returns the cache
                 # unchanged; still store the returned array (kv_cache is a
@@ -328,6 +333,36 @@ def _prepare_qkv_layout(
     )
 
 
+def _uniform_kv_transform(mesh: Mesh, num_kv_heads: int,
+                          head_size: int) -> Tuple[int, int]:
+    """(kv_repeat, kv_pack) that map a layer's K/V to the KV cache shape
+    planned by `utils.plan_uniform_kv_shapes` (UNIFORM_KV_PAGE=1); (1, 1)
+    when no shape was planned for this layer."""
+    padded_heads = utils.get_padded_num_heads(num_kv_heads,
+                                              mesh.shape["model"])
+    padded_dim = utils.get_padded_head_dim(head_size)
+    target_heads, target_dim = utils.get_uniform_kv_shape(
+        padded_heads, padded_dim)
+    if (target_heads, target_dim) == (padded_heads, padded_dim):
+        return 1, 1
+    if target_dim == padded_dim:
+        assert target_heads % num_kv_heads == 0
+        return target_heads // num_kv_heads, 1
+    assert padded_dim == head_size and target_dim % head_size == 0
+    kv_pack = target_dim // head_size
+    assert num_kv_heads == target_heads * kv_pack
+    return 1, kv_pack
+
+
+def _pack_onehot(num_heads: int, num_kv_heads: int, kv_pack: int,
+                 dtype) -> jax.Array:
+    """(num_heads, kv_pack) one-hot: the slot of each query head's KV head
+    inside the packed KV head that holds it."""
+    group = num_heads // num_kv_heads
+    slot = (np.arange(num_heads) // group) % kv_pack
+    return jnp.asarray(np.arange(kv_pack)[None, :] == slot[:, None], dtype)
+
+
 def _format_attention_output(
     outputs: jax.Array,
     q_len: int,
@@ -355,6 +390,8 @@ def _format_attention_output(
         "soft_cap",
         "update_kv_cache",
         "attention_backend",
+        "kv_repeat",
+        "kv_pack",
     ),
     donate_argnames=("kv_cache"),
 )
@@ -378,6 +415,8 @@ def _jax_attn_func(
     soft_cap: float | None = None,
     update_kv_cache: bool = True,
     attention_backend: str = RPAAttentionBackend.name,
+    kv_repeat: int = 1,
+    kv_pack: int = 1,
 ) -> Tuple[jax.Array, jax.Array]:
     q_len = q.shape[0]
     if k is None or v is None:
@@ -385,6 +424,22 @@ def _jax_attn_func(
         k = v = jnp.zeros((q_len, num_kv_heads * head_size),
                           dtype=kv_cache.dtype)
     q, k, v = _prepare_qkv_layout(q, k, v, num_heads, num_kv_heads, head_size)
+
+    # UNIFORM_KV_PAGE: bring K/V (and Q) to the layer's KV cache shape.
+    if kv_repeat > 1:
+        # Replicate KV heads; jnp.repeat keeps query head h on KV head
+        # h // (num_heads // num_kv_heads), as for TP replication.
+        k = jnp.repeat(k, kv_repeat, axis=1)
+        v = jnp.repeat(v, kv_repeat, axis=1)
+    if kv_pack > 1:
+        # Pack kv_pack adjacent KV heads into one head of kv_pack * head_size,
+        # and put each query head in its KV head's slot, zeros elsewhere: the
+        # scores only see its own KV head, and its output is that slot.
+        k = k.reshape(q_len, num_kv_heads // kv_pack, kv_pack * head_size)
+        v = v.reshape(q_len, num_kv_heads // kv_pack, kv_pack * head_size)
+        onehot = _pack_onehot(num_heads, num_kv_heads, kv_pack, q.dtype)
+        q = (q[:, :, None, :] * onehot[None, :, :, None]).reshape(
+            q_len, num_heads, kv_pack * head_size)
 
     new_kv_cache, outputs = attention(
         kv_cache,
@@ -404,6 +459,11 @@ def _jax_attn_func(
         shared_attention_metadata=shared_attention_metadata,
         attention_backend=create_attention_backend(attention_backend),
     )
+    if kv_pack > 1:
+        onehot = _pack_onehot(num_heads, num_kv_heads, kv_pack, outputs.dtype)
+        outputs = jnp.sum(outputs.reshape(q_len, num_heads, kv_pack, head_size)
+                          * onehot[None, :, :, None],
+                          axis=2)
 
     formatted_outputs = _format_attention_output(outputs, q_len, num_heads,
                                                  head_size, q.dtype)

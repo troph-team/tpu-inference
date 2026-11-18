@@ -585,6 +585,54 @@ class KVCacheManager:
                       for (heads, dim), size in page_sizes.items()))
         return True
 
+    def _maybe_plan_uniform_kv_shapes(
+            self, layers: dict[str, AttentionLayerBase]) -> bool:
+        """With UNIFORM_KV_PAGE=1, give all decoder attention layers one KV
+        cache shape (see `common_utils.plan_uniform_kv_shapes`).
+
+        Gemma 4 on TP=4: 16x256 sliding-window and 4x512 full-attention layers
+        both become 8x512 (same bytes per token as 16x256). vLLM's sliding and
+        full KV cache groups then alias one typed array per tensor, so no
+        page has to be padded to the sum of both shapes' page sizes.
+        """
+        if not common_utils.uniform_kv_page_enabled():
+            return False
+        if (tpu_envs.USE_FULL_KVCACHE_FOR_SLIDING_WINDOW or self.use_mla
+                or self.runner.vllm_config.scheduler_config.
+                disable_hybrid_kv_cache_manager):
+            return False
+        if any(isinstance(module, MambaBase) for module in layers.values()):
+            return False
+        attn_modules = [
+            module for module in layers.values()
+            if isinstance(module, Attention) and not is_cache_for_ds_v4(module)
+            and module.attn_type == AttentionType.DECODER
+        ]
+        tp_size = self.runner.mesh.shape["model"]
+        shapes = {(common_utils.get_padded_num_heads(module.num_kv_heads,
+                                                     tp_size),
+                   common_utils.get_padded_head_dim(module.head_size))
+                  for module in attn_modules}
+        if not common_utils.plan_uniform_kv_shapes(list(shapes), tp_size):
+            if len(shapes) > 1:
+                logger.warning(
+                    "UNIFORM_KV_PAGE=1 but KV shapes %s cannot share one "
+                    "shape; falling back to per-shape KV caches.",
+                    sorted(shapes))
+            return False
+        logger.info_once(
+            "UNIFORM_KV_PAGE: KV cache shape (num_kv_heads, head_dim) per "
+            "attention shape: %s; page size %d bytes.",
+            ", ".join(f"{h}x{d} -> {th}x{td}" for (h, d), (th, td) in sorted(
+                common_utils._UNIFORM_KV_SHAPES.items())),
+            int(
+                get_attention_page_size_bytes(
+                    self.runner.mesh, self.runner.cache_config.block_size,
+                    *next(iter(common_utils._UNIFORM_KV_SHAPES.values())),
+                    self.runner.kv_cache_dtype, False,
+                    self.runner.attention_backend)))
+        return True
+
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
 
@@ -740,13 +788,16 @@ class KVCacheManager:
             # hold one array per distinct shape (see
             # `_maybe_pad_pages_for_mixed_head_dims`), or disable sliding
             # window so that all layers fall into a single group.
+            # UNIFORM_KV_PAGE: map every layer to one KV cache shape instead,
+            # so all layers of a vLLM tensor alias one array with no padding.
+            uniform_kv = self._maybe_plan_uniform_kv_shapes(layers)
             head_size_set = {
                 common_utils.get_padded_head_dim(
                     getattr(attn_module, "head_size", 0))
                 for attn_module in layers.values()
                 if not isinstance(attn_module, MambaBase)
             }
-            disable_sliding_window = len(head_size_set) > 1
+            disable_sliding_window = len(head_size_set) > 1 and not uniform_kv
             if disable_sliding_window:
                 disable_sliding_window = (
                     not self._maybe_pad_pages_for_mixed_head_dims(layers))
@@ -790,6 +841,8 @@ class KVCacheManager:
                         self.runner.mesh.shape["model"])
                     head_size = common_utils.get_padded_head_dim(
                         attn_module.head_size)
+                    num_kv_heads, head_size = common_utils.get_uniform_kv_shape(
+                        num_kv_heads, head_size)
 
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[
