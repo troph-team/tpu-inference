@@ -500,10 +500,13 @@ class Gemma4MultiTokenPredictor(JaxModule):
                 cache_idx = i
 
             kv_cache = kv_caches[cache_idx]
+            layer_attention_metadata = (attention_metadata[layer_name]
+                                        if isinstance(attention_metadata, dict)
+                                        else attention_metadata)
             kv_cache, hidden_states, _ = layer(
                 kv_cache,
                 hidden_states,
-                attention_metadata,
+                layer_attention_metadata,
             )
             kv_caches[cache_idx] = kv_cache
 

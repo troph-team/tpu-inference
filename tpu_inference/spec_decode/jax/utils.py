@@ -108,10 +108,17 @@ def concat_last_sampled_tokens_and_draft_tokens(last_sampled_tokens,
 def get_draft_block_tables(
     runner: Any,
     req_indices_dp: Optional[dict[int, list[int]]] = None,
+    kv_cache_group_id: Optional[int] = None,
 ) -> Any:
-    """Build flattened draft block tables reordered per DP rank."""
+    """Build flattened draft block tables reordered per DP rank.
+
+    Uses the last KV cache group (the draft's own) unless `kv_cache_group_id`
+    names another one, e.g. the target group a KV-sharing draft layer reads.
+    """
     num_kv_cache_groups = len(runner.kv_cache_config.kv_cache_groups)
-    draft_kv_cache_group_id = num_kv_cache_groups - 1
+    draft_kv_cache_group_id = (num_kv_cache_groups - 1
+                               if kv_cache_group_id is None else
+                               kv_cache_group_id)
     cpu_tensor = runner.input_batch.block_table[
         draft_kv_cache_group_id].get_cpu_tensor()
     dp_size = getattr(runner, "dp_size", 1)

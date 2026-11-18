@@ -348,7 +348,20 @@ def get_flax_model(
     original_dtype = vllm_config.model_config.dtype
     model_dtype = to_jax_dtype(original_dtype)
     vllm_config.model_config.dtype = model_dtype
-    vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
+    if is_draft_model:
+        # The draft has its own checkpoint and quantization (e.g. a bf16 MTP
+        # assistant next to an int8 target), so build its quant config from
+        # the draft model config rather than the target's.
+        target_model_config = vllm_config.model_config
+        vllm_config.model_config = (
+            vllm_config.speculative_config.draft_model_config)
+        try:
+            vllm_config.quant_config = get_tpu_quantization_config(
+                vllm_config)
+        finally:
+            vllm_config.model_config = target_model_config
+    else:
+        vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
 
     # Only perform qwix quantization if it is jax model.
     if vllm_config.model_config:

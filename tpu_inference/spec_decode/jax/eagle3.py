@@ -100,7 +100,13 @@ class Eagle3Proposer:
                                                    is_draft_model=True)
         target_model_impl = resolve_model_impl_type(self.vllm_config,
                                                     is_draft_model=False)
-        if draft_model_impl != target_model_impl:
+        # A JAX Gemma 4 MTP draft can run next to a PyTorch-path target: it
+        # only needs the target's hidden states, KV cache (shared through the
+        # KV redirects) and embedding table, all of which are JAX arrays.
+        mixed_gemma4_mtp = (self.speculative_config.use_gemma4_mtp()
+                            and draft_model_impl == "flax_nnx"
+                            and target_model_impl == "vllm")
+        if draft_model_impl != target_model_impl and not mixed_gemma4_mtp:
             raise ValueError(
                 "The implementation of the draft model must be the same as the target model."
             )
@@ -125,12 +131,24 @@ class Eagle3Proposer:
 
             # 2. Resolve target embed param in target_model (which is already the target state)
             target_embed_param = None
-            for path in [
+            if mixed_gemma4_mtp:
+                # The PyTorch-path state is a flat {name: array} dict.
+                import types
+                for name in shared_names:
+                    if name in self.runner.state:
+                        value = self.runner.state[name]
+                        value = getattr(value, "_elem", value)  # torchax
+                        target_embed_param = types.SimpleNamespace(
+                            value=value)
+                        logger.info(
+                            f"Resolved target model embedding path: {name}")
+                        break
+            for path in ([] if mixed_gemma4_mtp else [
                     "model.language_model.embed_tokens.weight",
                     "language_model.embed_tokens.weight",
                     "model.embed_tokens.weight", "model.embed.embedding",
                     "model.embed_tokens.embedding"
-            ]:
+            ]):
                 try:
                     target_embed_param = get_param(target_model, path)
                     logger.info(
@@ -339,6 +357,21 @@ class Eagle3Proposer:
                                     block_tables,
                                     sharding=PartitionSpec(
                                         ShardingAxisName.ATTN_DATA))
+        # Gemma 4 MTP with a hybrid KV layout: each draft layer reads a
+        # target layer's cache, so it needs that layer's group block table.
+        draft_gids = self._draft_layer_kv_group_ids()
+        if draft_gids is not None:
+            per_gid = {
+                gid:
+                device_array(self.mesh,
+                             get_draft_block_tables(self.runner,
+                                                    req_indices_dp, gid),
+                             sharding=PartitionSpec(
+                                 ShardingAxisName.ATTN_DATA))
+                for gid in set(draft_gids)
+            }
+            self._draft_layer_block_tables = tuple(per_gid[gid]
+                                                   for gid in draft_gids)
         num_reqs = num_reqs_dp
         return self._prepare_inputs(
             state_leaves=self.state_leaves,
@@ -571,6 +604,29 @@ class Eagle3Proposer:
         )(positions, residual, hidden_states, last_token_indices)
         return positions, residual, draft_token_ids
 
+    def _draft_layer_kv_group_ids(self) -> Optional[tuple[int, ...]]:
+        """KV cache group of the target layer each Gemma 4 MTP draft layer
+        shares, or None when one block table serves every draft layer."""
+        if not hasattr(self, "_draft_gids"):
+            self._draft_gids = None
+            groups = self.runner.kv_cache_config.kv_cache_groups
+            shared = self.runner.kv_cache_manager.shared_kv_cache_layers
+            if self.speculative_config.use_gemma4_mtp() and len(groups) > 1:
+                name_to_gid = {
+                    name: gid
+                    for gid, group in enumerate(groups)
+                    for name in group.layer_names
+                }
+                gids = []
+                while f"draft_layer.{len(gids)}" in shared:
+                    gids.append(
+                        name_to_gid[shared[f"draft_layer.{len(gids)}"]])
+                if len(set(gids)) > 1:
+                    self._draft_gids = tuple(gids)
+                    logger.info("Gemma4-MTP draft layer KV cache groups: %s",
+                                self._draft_gids)
+        return self._draft_gids
+
     def propose(
         self,
         kv_caches: list[jax.Array],
@@ -579,8 +635,19 @@ class Eagle3Proposer:
         last_token_indices,
         target_hidden_states,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
+        draft_layer_block_tables = None
+        draft_gids = self._draft_layer_kv_group_ids()
+        if draft_gids is not None:
+            draft_layer_block_tables = getattr(self,
+                                               "_draft_layer_block_tables",
+                                               None)
+            self._draft_layer_block_tables = None
+            if draft_layer_block_tables is None:  # precompile: dummy tables
+                draft_layer_block_tables = (attn_metadata.block_tables, ) * len(
+                    draft_gids)
         return self._propose(
             state_leaves=self.state_leaves,
+            draft_layer_block_tables=draft_layer_block_tables,
             kv_caches=kv_caches,
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -618,6 +685,7 @@ class Eagle3Proposer:
         target_hidden_states,
         num_speculative_tokens: int,
         layer_name_to_kvcache_index: tuple,
+        draft_layer_block_tables: Optional[tuple[jax.Array, ...]] = None,
     ) -> tuple[list[jax.Array], jnp.ndarray]:
         """Proposes draft tokens using the draft model.
         Returns:
@@ -625,12 +693,20 @@ class Eagle3Proposer:
             draft token IDs.
         """
 
+        def draft_metadata(md):
+            if draft_layer_block_tables is None:
+                return md
+            return {
+                f"draft_layer.{i}": replace(md, block_tables=bt)
+                for i, bt in enumerate(draft_layer_block_tables)
+            }
+
         kv_caches, hidden_states, residual, _ = self.model_fn(
             state_leaves,
             kv_caches,
             input_ids,
             target_hidden_states,
-            attn_metadata,
+            draft_metadata(attn_metadata),
             layer_name_to_kvcache_index,
             spec_step_idx=0,
         )
@@ -671,7 +747,7 @@ class Eagle3Proposer:
                 kv_caches,
                 input_ids_loop,
                 hidden_states,
-                attn_metadata,
+                draft_metadata(attn_metadata),
                 layer_name_to_kvcache_index,
                 spec_step_idx=i + 1,
             )
