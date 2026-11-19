@@ -9,7 +9,8 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from tpu_inference import utils
-from tpu_inference.kernels.collectives import quantized_matmul_reduce_scatter as qmrs
+from tpu_inference.kernels.collectives import \
+    quantized_matmul_reduce_scatter as qmrs
 
 jax.config.parse_flags_with_absl()
 
@@ -24,12 +25,12 @@ def _reference(x, w, s, axis, int8_act):
     if int8_act:
         xq, sx = qmrs_quantize(x)
         acc = jax.lax.dot(xq, w, preferred_element_type=jnp.int32)
-        acc = acc.astype(jnp.float32) * sx
+        acc = acc.astype(jnp.float32) * sx.reshape(-1, 1)
     else:
         acc = jax.lax.dot(x,
                           w.astype(jnp.bfloat16),
                           preferred_element_type=jnp.float32)
-    return jax.lax.psum_scatter(acc * s,
+    return jax.lax.psum_scatter(acc * s[None, :],
                                 axis,
                                 scatter_dimension=0,
                                 tiled=True)
@@ -51,8 +52,8 @@ class RingOrderTest(parameterized.TestCase):
             dist = abs(ca[0] - cb[0]) + abs(ca[1] - cb[1])
             self.assertEqual(dist, 1, (order, ca, cb))
 
-    @parameterized.parameters((2, 2), (2, 4), (4, 2), (4, 4), (3, 2),
-                              (2, 3), (4, 3))
+    @parameterized.parameters((2, 2), (2, 4), (4, 2), (4, 4), (3, 2), (2, 3),
+                              (4, 3))
     def test_grid_is_neighbour_cycle(self, nx, ny):
         coords = [(x, y, 0) for y in range(ny) for x in range(nx)]
         # Shuffle so the result cannot rely on device order.
@@ -114,16 +115,16 @@ class QuantizedMatmulReduceScatterTest(jtu.JaxTestCase):
                 x, sx = qmrs_quantize(x)
             plan = qmrs.choose_blocks(x.shape[0], x.shape[1], w.shape[1], D,
                                       int8_act)
-            return qmrs.quantized_matmul_reduce_scatter(
-                x,
-                w,
-                s,
-                axis=axis,
-                order=order,
-                sx=sx,
-                bn=plan[0],
-                bk=plan[1],
-                bidir=bidir and plan[2])
+            return qmrs.quantized_matmul_reduce_scatter(x,
+                                                        w,
+                                                        s,
+                                                        axis=axis,
+                                                        order=order,
+                                                        sx=sx,
+                                                        bn=plan[0],
+                                                        bk=plan[1],
+                                                        bidir=bidir
+                                                        and plan[2])
 
         def ref(x, w, s):
             return _reference(x, w, s, axis, int8_act)
@@ -145,9 +146,8 @@ class QuantizedMatmulReduceScatterTest(jtu.JaxTestCase):
         # Several calls on fresh data to expose races between calls.
         for i in range(5):
             k0, k1, k2 = jax.random.split(jax.random.key(1234 + i), 3)
-            x = jax.device_put(
-                jax.random.normal(k0, (T, K), jnp.bfloat16),
-                NamedSharding(mesh, in_specs[0]))
+            x = jax.device_put(jax.random.normal(k0, (T, K), jnp.bfloat16),
+                               NamedSharding(mesh, in_specs[0]))
             w = jax.device_put(
                 jax.random.randint(k1, (K, N), -127, 128, jnp.int8),
                 NamedSharding(mesh, in_specs[1]))

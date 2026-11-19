@@ -196,13 +196,17 @@ def ring_order(devices: Sequence) -> list[int]:
         cycle = [(0, r) for r in range(Y)]
     index = {}
     for i, c in enumerate(coords):
-        key = (xs.index(c[1]), ys.index(c[0])) if transpose else (
-            xs.index(c[0]), ys.index(c[1]))
+        key = (xs.index(c[1]),
+               ys.index(c[0])) if transpose else (xs.index(c[0]),
+                                                  ys.index(c[1]))
         index[key] = i
     return [index[c] for c in cycle]
 
 
-def _largest_div(total: int, cap: int, quantum: int = 128, even_quotient=False):
+def _largest_div(total: int,
+                 cap: int,
+                 quantum: int = 128,
+                 even_quotient=False):
     best = None
     for b in range(quantum, min(total, cap) + 1, quantum):
         if total % b == 0 and (not even_quotient or (total // b) % 2 == 0):
@@ -272,7 +276,8 @@ def quantized_matmul_reduce_scatter(x: jax.Array,
     if bn is None or bk is None or bidir is None:
         plan = choose_blocks(T, K, N, D, int8_act)
         if plan is None:
-            raise ValueError(f"unsupported shape x {x.shape} w {w.shape} D={D}")
+            raise ValueError(
+                f"unsupported shape x {x.shape} w {w.shape} D={D}")
         bn = bn or plan[0]
         bk = bk or plan[1]
         bidir = plan[2] if bidir is None else bidir
@@ -311,8 +316,8 @@ def quantized_matmul_reduce_scatter(x: jax.Array,
     args += [w, s.reshape(1, N).astype(jnp.float32)]
     # The output block index only moves during the last step, so only final
     # tiles are written back to HBM.
-    out_spec = pl.BlockSpec((tm, bn),
-                            lambda j, n, t: (0, jnp.where(j == D - 1, n, 0)))
+    out_spec = pl.BlockSpec((tm, bn), lambda j, n, t:
+                            (0, jnp.where(j == D - 1, n, 0)))
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
