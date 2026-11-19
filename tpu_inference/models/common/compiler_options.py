@@ -1,3 +1,4 @@
+import os
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +49,13 @@ def get_step_fn_compiler_options():
         "post_spmd_conservative",
         "xla_tpu_use_minor_sharding_for_major_trivial_input": "true",
     }
+    # Experiment overrides (DEFAULT, NONE, POST_SPMD, PRE_SPMD, POST_SPMD_CONSERVATIVE).
+    if os.environ.get("XLA_AG_CM_MODE"):
+        compiler_options["xla_tpu_all_gather_collective_matmul_mode"] = (
+            os.environ["XLA_AG_CM_MODE"])
+    if os.environ.get("XLA_RS_CM_MODE"):
+        compiler_options["xla_tpu_reduce_scatter_collective_matmul_mode"] = (
+            os.environ["XLA_RS_CM_MODE"])
     sc_offload_bytes = _get_sc_allreduce_allgather_offload_min_size_bytes()
     if sc_offload_bytes > 0:
         threshold_bytes = str(sc_offload_bytes)
